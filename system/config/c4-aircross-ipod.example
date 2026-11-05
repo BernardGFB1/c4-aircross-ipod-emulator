@@ -1,0 +1,21 @@
+# c4-aircross-ipod.example v1 (2026-11-05) - wzór pliku /etc/default/c4-aircross-ipod
+# Skopiuj: sudo cp c4-aircross-ipod.example /etc/default/c4-aircross-ipod
+# i wpisz swoje wartości. Czytają go: bt-autoconnect.sh i usługa ipod-gadget (EnvironmentFile).
+
+# Adres Bluetooth iPhone'a (bluetoothctl devices, po sparowaniu)
+IPHONE_MAC=AA:BB:CC:DD:EE:FF
+
+# Adres adaptera Bluetooth Pi (bluetoothctl show -> Controller). Opcjonalny: jeśli podany,
+# bt-autoconnect zapisze w logu, gdy po starcie adapter ma inny adres (iPhone go wtedy "nie zna").
+ADAPTER_MAC=
+
+# Napisy na ekranie "teraz gra" radia (radio wycina apostrofy)
+IPOD_SCREEN_TITLE=iPhone
+IPOD_SCREEN_ARTIST=RaspberryPI
+IPOD_SCREEN_ALBUM=Bluetooth
+
+# Tryb powiadomień dla radia: 3 = pozycja utworu co 1 s (zalecany, bez tego ekran stoi na 00'00").
+# 1 i 2 (zmiana utworu) psuły przełączanie utworów - zostawione do eksperymentów.
+IPOD_NOTIFY_MODE=3
+# Plik, który (jeśli istnieje) nadpisuje IPOD_NOTIFY_MODE na bieżąco, bez restartu
+IPOD_NOTIFY_FILE=/etc/c4-aircross-ipod/notify-mode

@@ -1,0 +1,11 @@
+# bt-autoconnect.service v2 (2026-11-05) - łączenie z iPhone'em i samonaprawa Bluetooth
+[Unit]
+Description=Auto-connect iPhone
+After=bluetooth.service bluealsa.service
+
+[Service]
+ExecStart=/usr/local/bin/bt-autoconnect.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

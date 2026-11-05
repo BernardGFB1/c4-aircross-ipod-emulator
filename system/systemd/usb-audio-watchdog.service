@@ -1,0 +1,12 @@
+# usb-audio-watchdog.service v1 (2026-10-09) - restart gadżetu, gdy radio przestaje pobierać dźwięk
+[Unit]
+Description=Restart iPod gadget when radio stops pulling USB audio
+After=ipod-gadget.service bt-to-ipod.service bluetooth.service
+
+[Service]
+ExecStart=/usr/local/bin/usb-audio-watchdog.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

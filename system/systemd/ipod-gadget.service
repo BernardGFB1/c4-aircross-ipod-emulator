@@ -1,0 +1,19 @@
+# ipod-gadget.service v2 (2026-11-05) - moduły gadżetu iPoda + klient iAP z mostkiem Bluetooth
+# Ścieżki: /opt/c4-aircross-ipod/{ipod,ipod-gadget} (README, sekcja Instalacja)
+[Unit]
+Description=iPod gadget
+After=local-fs.target bluetooth.service
+
+[Service]
+EnvironmentFile=-/etc/default/c4-aircross-ipod
+ExecStartPre=/sbin/modprobe libcomposite
+ExecStartPre=-/sbin/insmod /opt/c4-aircross-ipod/ipod-gadget/gadget/g_ipod_audio.ko
+ExecStartPre=-/sbin/insmod /opt/c4-aircross-ipod/ipod-gadget/gadget/g_ipod_hid.ko
+ExecStartPre=-/sbin/insmod /opt/c4-aircross-ipod/ipod-gadget/gadget/g_ipod_gadget.ko
+# klient kończy się na EOF po odłączeniu kabla od radia - wtedy startuje od nowa
+ExecStart=/opt/c4-aircross-ipod/ipod/ipod serve /dev/iap0
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

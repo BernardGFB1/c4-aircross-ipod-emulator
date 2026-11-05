@@ -1,0 +1,17 @@
+# bt-to-ipod.service v3 (2026-11-05) - dźwięk z iPhone'a (bluealsa) na kartę USB iPoda
+[Unit]
+Description=Bluetooth audio to iPod
+After=bluealsa.service ipod-gadget.service
+Requires=bluealsa.service
+
+[Service]
+# użytkownik systemowy w grupie audio (polityka D-Bus bluealsa wpuszcza grupę audio; ma też dostęp
+# do /dev/snd). Tworzy go: sudo useradd --system --no-create-home --groups audio c4ipod
+# DynamicUser=yes nie działa: dbus-daemon nie widzi grupy dodanej przez SupplementaryGroups.
+User=c4ipod
+ExecStart=/usr/bin/bluealsa-aplay --pcm=plughw:CARD=iPodUSB,DEV=0
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

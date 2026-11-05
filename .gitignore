@@ -1,0 +1,18 @@
+# .gitignore v1 (2026-11-05)
+# artefakty kompilacji
+ipod/ipod
+ipod/ipod.v*
+ipod-gadget/gadget/*.ko
+ipod-gadget/gadget/*.o
+ipod-gadget/gadget/*.mod
+ipod-gadget/gadget/*.mod.c
+ipod-gadget/gadget/.*.cmd
+ipod-gadget/gadget/modules.order
+ipod-gadget/gadget/Module.symvers
+# śmieci z logowania klienta iAP
+ipod/CMD
+ipod/FRAME
+ipod/PACKET
+# lokalne ustawienia z prawdziwymi adresami
+system/config/c4-aircross-ipod
+.DS_Store
