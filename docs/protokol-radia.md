@@ -1,4 +1,4 @@
-<!-- protokol-radia.md v1 (2026-11-05) -->
+<!-- protokol-radia.md v2 (2026-11-05) -->
 # Jak radio C4 Aircross rozmawia z „iPodem”
 
 Ustalenia z logów zebranych podczas budowy emulatora (wrzesień–listopad 2026). Radio:
@@ -114,7 +114,9 @@ Wszystko poniżej to obserwacje z tego jednego radia. Inne radia z iAP mogą si�
   odsyłamy dalej z ciszą, a blokadę inicjujemy raz, a nie przy każdym `pcm_open`.
   Szczegóły w `patches/`.
 - Na wszelki wypadek działa też strażnik (`usb-audio-watchdog`). Jeśli radio ma włączony
-  tryb audio, iPhone gra, a `hw_ptr` stoi przez 10 s, restartuje gadżet.
+  tryb audio, iPhone gra, karta USB jest otwarta, a `hw_ptr` stoi przez 10 s, restartuje gadżet.
+  Zamknięta karta (brak dźwięku z iPhone'a) to sprawa Bluetooth, nie radia. Wcześniejsza wersja
+  strażnika restartowała wtedy gadżet i niepotrzebnie rozłączała radio.
 
 ## 8. Zakłócenia i resety USB
 
@@ -143,6 +145,11 @@ Wszystko poniżej to obserwacje z tego jednego radia. Inne radia z iAP mogą si�
   a później wraca na początek bieżącego.
 - iPhone pamięta nazwę urządzenia z chwili parowania. Zmiana nazwy Pi (`bluetoothctl system-alias`)
   nie odświeża jej w telefonie, trzeba ją zmienić ręcznie w ustawieniach Bluetooth.
+- **iPhone potrafi przestać wysyłać dźwięk, choć połączenie trwa,** a AVRCP dalej zgłasza `playing`
+  (widziane raz po ~30 min jazdy, przyczyna nieznana: iPhone albo zawieszona bluealsa). Samo istnienie
+  transportu nie świadczy więc o zdrowiu. `bt-autoconnect` (v8) uznaje za awarię sytuację, w której
+  iPhone zgłasza `playing`, a transport BlueZ nie jest `active` albo strumień bluealsa nie ma
+  `Running=true`.
 - Przy każdym starcie układ Bluetooth Pi przez chwilę ma domyślny adres (`43:43:a1:…`),
   który BlueZ potem poprawia. `bt-autoconnect` zapisuje w logu, gdy adres się nie zgadza.
 

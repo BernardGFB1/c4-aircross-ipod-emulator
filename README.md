@@ -1,4 +1,4 @@
-<!-- README.md v1 (2026-11-05) -->
+<!-- README.md v2 (2026-11-05) -->
 # Emulator iPoda dla radia Citroëna C4 Aircross
 
 
@@ -22,7 +22,7 @@ iPhone ──Bluetooth (AAC/A2DP + AVRCP)──▶ Pi Zero 2W ──USB (iAP + U
 - **pauza i gaszenie auta**: utwór zostaje w tym samym miejscu,
 - **zimny start**: muzyka gra sama ~30 s po włączeniu zapłonu, bez dotykania telefonu,
 - ekran radia pokazuje **czas utworu** i stałe napisy (ustawiane w pliku konfiguracyjnym),
-- **samonaprawa Bluetooth**: gdy iPhone długo się nie łączy, Pi samo restartuje Bluetooth w trzech krokach,
+- **samonaprawa Bluetooth**: gdy iPhone długo się nie łączy albo gra, ale dźwięk nie dociera do Pi, Pi samo naprawia połączenie w trzech krokach,
 - **strażnik USB**: gdy radio przestaje pobierać dźwięk, Pi samo restartuje gadżet iPoda.
 
 Jak to wszystko działa po stronie radia (i dlaczego właśnie tak), opisuje

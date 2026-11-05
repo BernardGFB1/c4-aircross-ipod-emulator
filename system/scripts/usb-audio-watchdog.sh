@@ -1,6 +1,9 @@
 #!/bin/bash
-# usb-audio-watchdog.sh v2 (2026-11-05) - pilnuje toru audio Pi -> radio (USB, karta iPodUSB)
+# usb-audio-watchdog.sh v3 (2026-11-05) - pilnuje toru audio Pi -> radio (USB, karta iPodUSB)
 # v2: adres iPhone'a z /etc/default/c4-aircross-ipod zamiast wpisanego na sztywno.
+# v3: zawieszenie liczy się tylko przy otwartej karcie (hw_ptr jest liczbą). Zamknięta karta
+#     (hw_ptr=brak) znaczy, że nie ma dźwięku z iPhone'a - to sprawa Bluetooth (bt-autoconnect),
+#     a restart gadżetu tylko rozłączał wtedy radio.
 # Objaw po zimnym starcie: radio włącza audio (ipod_audio_set_alt(1,1) / "audio start"),
 # ale nie pobiera próbek (hw_ptr stoi), a przełączenie źródła w radiu nie pomaga.
 # Jeśli tak jest przez STUCK_SEC, a iPhone gra - restartujemy gadżet iPoda (radio inicjuje go od nowa).
@@ -21,7 +24,7 @@ while true; do
   # iPhone gra?
   st=$(busctl get-property org.bluez $PLAYER org.bluez.MediaPlayer1 Status 2>/dev/null)
   ptr=$(grep -oE "^hw_ptr *: *[0-9]+" $STATUS 2>/dev/null | grep -oE "[0-9]+$")
-  if [ "$ev" = "ipod-gadget-audio: audio start" ] && [ "$st" = 's "playing"' ] && [ "$ptr" = "$last_ptr" ]; then
+  if [ "$ev" = "ipod-gadget-audio: audio start" ] && [ "$st" = 's "playing"' ] && [ -n "$ptr" ] && [ "$ptr" = "$last_ptr" ]; then
     stuck=$((stuck+2))
   else
     stuck=0
