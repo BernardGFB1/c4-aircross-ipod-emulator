@@ -1,0 +1,727 @@
+// bt.go v25 (2026-11-05) - mostek radio <-> iPhone (v24 + plik stanu radia dla samonaprawy Bluetooth)
+package main
+
+// Most między radiem (iAP, lingo ExtRemote) a iPhonem (Bluetooth AVRCP przez BlueZ).
+// Przyciski z radia -> org.bluez.MediaPlayer1 (Next/Previous/Play/Pause),
+// tytuł/wykonawca/album/czas z iPhone'a -> odpowiedzi dla radia.
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/godbus/dbus/v5"
+	"github.com/oandrew/ipod"
+	extremote "github.com/oandrew/ipod/lingo-extremote"
+)
+
+// Mała udawana baza: radio przy "potwierdzaniu mediów" czyta ją całą,
+// a 3 pozycje wystarczą, żeby odróżnić następny od poprzedniego.
+const fakeTrackCount = 3
+
+// Ustawienia z pliku /etc/default/c4-aircross-ipod (usługa ładuje go jako EnvironmentFile).
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// Tryb powiadomień dla radia: 0 = brak, 1 = zmiana utworu, 2 = zmiana utworu + pozycja co 1 s,
+// 3 = tylko pozycja co 1 s (domyślnie - bez pozycji ekran "teraz gra" radia się nie odświeża,
+// a tryby 1 i 2 psuły zmianę utworu). Plik IPOD_NOTIFY_FILE, jeśli istnieje, nadpisuje
+// IPOD_NOTIFY_MODE na bieżąco, bez restartu (do eksperymentów):
+//
+//	echo 3 > /etc/c4-aircross-ipod/notify-mode
+var notifyModeFile = envOr("IPOD_NOTIFY_FILE", "/etc/c4-aircross-ipod/notify-mode")
+
+func notifyMode() int {
+	src := envOr("IPOD_NOTIFY_MODE", "3")
+	if b, err := os.ReadFile(notifyModeFile); err == nil {
+		src = string(b)
+	}
+	m, err := strconv.Atoi(strings.TrimSpace(src))
+	if err != nil {
+		return 3
+	}
+	return m
+}
+
+// TEST: dopisujemy znaczniki do napisów, żeby zobaczyć na ekranie radia,
+// z której odpowiedzi radio bierze tekst (T:=tytuł, A:=wykonawca, L:=album,
+// G:=gatunek, DBk#n = pozycja z bazy utworów/playlist)
+const labelTest = false
+
+// Napisy na ekranie "teraz gra". Radio pyta o tytuł tylko raz, zaraz po swoim wyborze utworu,
+// a przy "następnym na zgadywanie" iPhone nie zdąży jeszcze podać nowego tytułu - dlatego
+// zamiast prawdziwych tytułów wyświetlamy stałe napisy (radio wycina apostrofy).
+var (
+	screenTitle  = envOr("IPOD_SCREEN_TITLE", "iPhone")       // tytuł utworu (kategoria 5)
+	screenArtist = envOr("IPOD_SCREEN_ARTIST", "RaspberryPI") // wykonawca (kategoria 2)
+	screenAlbum  = envOr("IPOD_SCREEN_ALBUM", "Bluetooth")    // album (kategoria 3) i pozostałe
+)
+
+// dbName: nazwa rekordu bazy dla danej kategorii (iAP: 1 playlista, 2 wykonawca, 3 album, 5 utwór)
+func dbName(category byte) string {
+	switch category {
+	case 5:
+		return screenTitle
+	case 2:
+		return screenArtist
+	default:
+		return screenAlbum
+	}
+}
+
+func label(prefix, s string) string {
+	if labelTest {
+		return prefix + s
+	}
+	return s
+}
+
+type btBridge struct {
+	mu          sync.Mutex
+	conn        *dbus.Conn
+	curIndex    int32
+	toggleTimer *time.Timer
+	lastSelect  time.Time
+	radioPaused bool // stan odtwarzania z punktu widzenia radia
+	notifyOn    bool // radio włączyło powiadomienia o zmianie stanu
+	lastTrack   string
+	lastPos     uint32 // ostatnia pozycja wysłana radiu (ms) - do wykrywania przewijania
+	lastPosAt   time.Time
+	cached      trackInfo // ostatni znany utwór z iPhone'a (odświeżany w tle)
+	fresh       bool      // nowe połączenie z radiem: pierwszy wybór utworu nie przełącza
+	connectedAt time.Time // kiedy radio połączyło się z Pi (start sekwencji startowej radia)
+	pendingPlay bool      // radio chciało Play, zanim iPhone się połączył - wyślemy, gdy się pojawi
+	lastToggle  time.Time // kiedy radio ostatnio wysłało Toggle (0x01)
+	spec        bool      // po Toggle zgadujemy Next, czekamy na wybór utworu
+	specSent    bool      // zgadywany Next już poszedł do iPhone'a
+	nextTimer   *time.Timer
+}
+
+var (
+	frameMu     sync.Mutex // jeden zapis ramki USB naraz
+	asyncMu     sync.Mutex
+	asyncSender func(cmd *ipod.Command)
+	pollerOnce  sync.Once
+)
+
+func setAsyncSender(f func(cmd *ipod.Command)) {
+	asyncMu.Lock()
+	asyncSender = f
+	asyncMu.Unlock()
+	if f != nil {
+		bt.mu.Lock()
+		bt.fresh = true
+		bt.connectedAt = time.Now()
+		bt.mu.Unlock()
+		pollerOnce.Do(func() { go bt.trackPoller() })
+	}
+}
+
+// radioIdentified: radio przedstawiło się od nowa (IdentifyDeviceLingoes) - np. po resecie
+// USB przy otwieraniu szyb albo po ponownym uruchomieniu radia bez restartu Pi.
+// Zaczyna się sekwencja startowa radia, więc jak przy nowym połączeniu.
+func radioIdentified() {
+	bt.mu.Lock()
+	bt.fresh = true
+	bt.connectedAt = time.Now()
+	// do pierwszego wyboru utworu radio jeszcze nie chce dźwięku (samonaprawa ma wtedy czekać)
+	writeRadioState(true)
+	bt.mu.Unlock()
+	log.Infof("bt: radio przedstawiło się od nowa - sekwencja startowa")
+}
+
+// Stan radia dla bt-autoconnect.sh: "playing", gdy radio chce grać (ostatnie polecenie z radia),
+// "paused" w przeciwnym razie. Brak pliku = brak radia (usługa ipod-gadget zatrzymana).
+// Samonaprawa Bluetooth opiera się na tym, czego chce radio, a nie na tym, co zgłasza iPhone.
+var radioStateFile = envOr("IPOD_STATE_FILE", "/run/c4-aircross-ipod/radio-state")
+
+// writeRadioState zapisuje stan atomowo (plik tymczasowy + rename); wywoływać pod b.mu.
+func writeRadioState(paused bool) {
+	st := "playing\n"
+	if paused {
+		st = "paused\n"
+	}
+	tmp := radioStateFile + ".tmp"
+	if err := os.WriteFile(tmp, []byte(st), 0644); err != nil {
+		return
+	}
+	os.Rename(tmp, radioStateFile)
+}
+
+func sendNotify(payload []byte) bool {
+	asyncMu.Lock()
+	send := asyncSender
+	asyncMu.Unlock()
+	bt.mu.Lock()
+	on := bt.notifyOn
+	bt.mu.Unlock()
+	if send == nil || !on {
+		return false
+	}
+	send(&ipod.Command{ID: ipod.NewLingoCmdID(0x04, 0x0027), Payload: payload})
+	return true
+}
+
+func be32(v uint32) []byte {
+	return []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
+}
+
+// notifyTrackChanged: PlayStatusChangeNotification 0x01 + indeks utworu
+func (b *btBridge) notifyTrackChanged() {
+	m := notifyMode()
+	if m != 1 && m != 2 {
+		return
+	}
+	b.mu.Lock()
+	idx := b.curIndex
+	b.mu.Unlock()
+	if sendNotify(append([]byte{0x01}, be32(uint32(idx))...)) {
+		log.Infof("bt: powiadomienie radia o zmianie utworu (tryb %d, #%d)", m, idx)
+	}
+}
+
+// notifyPosition: PlayStatusChangeNotification 0x04 + pozycja w ms (jak prawdziwy iPod co sekundę)
+func (b *btBridge) notifyPosition() {
+	m := notifyMode()
+	if m != 2 && m != 3 {
+		return
+	}
+	pos, playing := b.status()
+	if !playing {
+		return
+	}
+	// DIAGNOSTYKA: skoki pozycji (przewijanie na iPhonie) - sprawdzamy, czy radio na nie reaguje Toggle
+	b.mu.Lock()
+	prev, prevAt := b.lastPos, b.lastPosAt
+	b.lastPos, b.lastPosAt = pos, time.Now()
+	b.mu.Unlock()
+	if !prevAt.IsZero() && time.Since(prevAt) < 3*time.Second {
+		expected := prev + uint32(time.Since(prevAt)/time.Millisecond)
+		if pos+1500 < prev {
+			log.Infof("bt: pozycja cofnięta %d -> %d ms (przewijanie?)", prev, pos)
+		} else if pos > expected+3000 {
+			log.Infof("bt: pozycja do przodu %d -> %d ms (przewijanie?)", prev, pos)
+		}
+	}
+	sendNotify(append([]byte{0x04}, be32(pos)...))
+}
+
+// trackPoller co sekundę sprawdza, czy na iPhonie zmienił się utwór
+// (z kierownicy, z telefonu albo sam z siebie) i daje znać radiu.
+func (b *btBridge) trackPoller() {
+	tick := 0
+	for range time.Tick(500 * time.Millisecond) {
+		tick++
+		if tick%2 == 0 {
+			b.notifyPosition()
+		}
+		// iPhone połączył się po tym, jak radio poprosiło o Play - wznawiamy muzykę
+		b.mu.Lock()
+		pending := b.pendingPlay && !b.radioPaused
+		b.mu.Unlock()
+		if pending {
+			if _, ok := b.playerPath(); ok {
+				b.mu.Lock()
+				b.pendingPlay = false
+				b.mu.Unlock()
+				log.Infof("bt: iPhone połączony - wysyłam zaległe Play")
+				b.call("Play")
+			}
+		}
+		t := b.track()
+		key := t.Title + "\x00" + t.Artist + "\x00" + t.Album
+		b.mu.Lock()
+		changed := key != b.lastTrack
+		b.lastTrack = key
+		b.cached = t
+		b.mu.Unlock()
+		if changed {
+			log.Infof("bt: teraz gra: %s - %s", t.Artist, t.Title)
+			b.notifyTrackChanged()
+		}
+	}
+}
+
+var bt = &btBridge{curIndex: 0}
+
+// cachedTrack zwraca utwór bez pytania iPhone'a, żeby odpowiedź do radia
+// poszła natychmiast (zapytanie przez Bluetooth trwa ~25 ms)
+func (b *btBridge) cachedTrack() trackInfo {
+	b.mu.Lock()
+	t := b.cached
+	b.mu.Unlock()
+	if t.Title == "" {
+		t = b.track()
+	}
+	return t
+}
+
+func (b *btBridge) dbusConn() *dbus.Conn {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.conn == nil || !b.conn.Connected() {
+		c, err := dbus.ConnectSystemBus()
+		if err != nil {
+			log.Warnf("bt: brak połączenia z D-Bus: %v", err)
+			return nil
+		}
+		b.conn = c
+	}
+	return b.conn
+}
+
+// playerPath szuka aktywnego odtwarzacza AVRCP (np. /org/bluez/hci0/dev_XX/player0).
+func (b *btBridge) playerPath() (dbus.ObjectPath, bool) {
+	c := b.dbusConn()
+	if c == nil {
+		return "", false
+	}
+	var objs map[dbus.ObjectPath]map[string]map[string]dbus.Variant
+	err := c.Object("org.bluez", "/").Call("org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&objs)
+	if err != nil {
+		log.Warnf("bt: GetManagedObjects: %v", err)
+		return "", false
+	}
+	for p, ifaces := range objs {
+		if _, ok := ifaces["org.bluez.MediaPlayer1"]; ok && strings.Contains(string(p), "/player") {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+func (b *btBridge) call(method string) {
+	go func() {
+		p, ok := b.playerPath()
+		if !ok {
+			b.mu.Lock()
+			switch method {
+			case "Play":
+				b.pendingPlay = true
+			case "Pause":
+				b.pendingPlay = false
+			}
+			b.mu.Unlock()
+			log.Warnf("bt: brak odtwarzacza AVRCP, pomijam %s", method)
+			return
+		}
+		err := b.dbusConn().Object("org.bluez", p).Call("org.bluez.MediaPlayer1."+method, 0).Err
+		log.Infof("bt: %s -> %v", method, err)
+	}()
+}
+
+// callSeq wysyła kilka komend po kolei (np. Next, potem Play, bo iPhone
+// po zmianie utworu bywa zapauzowany)
+func (b *btBridge) callSeq(methods ...string) {
+	b.callSeqGap(60*time.Millisecond, methods...)
+}
+
+func (b *btBridge) callSeqGap(gap time.Duration, methods ...string) {
+	go func() {
+		p, ok := b.playerPath()
+		if !ok {
+			log.Warnf("bt: brak odtwarzacza AVRCP, pomijam %v", methods)
+			return
+		}
+		for i, m := range methods {
+			if i > 0 {
+				time.Sleep(gap)
+			}
+			err := b.dbusConn().Object("org.bluez", p).Call("org.bluez.MediaPlayer1."+m, 0).Err
+			log.Infof("bt: %s -> %v", m, err)
+		}
+	}()
+}
+
+func (b *btBridge) prop(name string) (dbus.Variant, bool) {
+	p, ok := b.playerPath()
+	if !ok {
+		return dbus.Variant{}, false
+	}
+	v, err := b.dbusConn().Object("org.bluez", p).GetProperty("org.bluez.MediaPlayer1." + name)
+	if err != nil {
+		return dbus.Variant{}, false
+	}
+	return v, true
+}
+
+type trackInfo struct {
+	Title, Artist, Album string
+	Duration             uint32 // ms
+}
+
+func (b *btBridge) track() trackInfo {
+	t := trackInfo{Title: "Bluetooth", Artist: "iPhone", Album: "", Duration: 0}
+	v, ok := b.prop("Track")
+	if !ok {
+		return t
+	}
+	m, ok := v.Value().(map[string]dbus.Variant)
+	if !ok {
+		return t
+	}
+	if s, ok := m["Title"].Value().(string); ok && s != "" {
+		t.Title = s
+	}
+	if s, ok := m["Artist"].Value().(string); ok {
+		t.Artist = s
+	}
+	if s, ok := m["Album"].Value().(string); ok {
+		t.Album = s
+	}
+	if d, ok := m["Duration"].Value().(uint32); ok {
+		t.Duration = d
+	}
+	return t
+}
+
+func (b *btBridge) status() (pos uint32, playing bool) {
+	playing = true
+	if v, ok := b.prop("Status"); ok {
+		if s, ok := v.Value().(string); ok {
+			playing = s == "playing"
+		}
+	}
+	if v, ok := b.prop("Position"); ok {
+		if p, ok := v.Value().(uint32); ok {
+			pos = p
+		}
+	}
+	return
+}
+
+// Radio przy "następny/poprzedni" wysyła: Toggle (0x01), a ~1,05 s później
+// PlayCurrentSelection(nowy indeks). Przy zwykłej pauzie - sam Toggle.
+// Radio samo wycisza dźwięk od Toggle do wyboru utworu, więc żeby nowy utwór
+// już grał, gdy radio go odciszy, przy Toggle (gdy gra) od razu wysyłamy
+// Next "na zgadywanie" (spec). Wybór utworu potwierdza go albo poprawia
+// (Previous...), a jeśli wybór nie przyjdzie w specTimeout - to była zwykła
+// pauza: cofamy Next (Previous) i pauzujemy.
+// Stan radia (radioPaused) zmieniamy od razu - radio pyta o niego w międzyczasie.
+const specTimeout = 1500 * time.Millisecond
+
+// Zgadywany Next wysyłamy dopiero po specDelay: przy prawdziwej pauzie (też przy gaszeniu
+// auta) radio ~0,14 s po Toggle pyta o stan (GetPlayStatus), przy zmianie utworu - nigdy.
+// Pauza rozpoznana przed wysłaniem Next = zwykłe Pause, utwór zostaje w tym samym miejscu.
+const specDelay = 300 * time.Millisecond
+
+// przez tyle czasu od połączenia radia Toggle traktujemy jako część sekwencji startowej
+const startupWindow = 20 * time.Second
+
+// odstęp między kolejnymi Previous - iPhone musi zdążyć zmienić utwór
+const prevGap = 300 * time.Millisecond
+
+func (b *btBridge) handleToggle() {
+	b.mu.Lock()
+	// Toggle tuż po wyborze utworu (radio przy starcie wysyła oba w ~1 ms) to część
+	// sekwencji startowej radia, nie pauza. Okno krótkie, żeby nie gubić szybkich kliknięć.
+	if time.Since(b.lastSelect) < 300*time.Millisecond {
+		b.mu.Unlock()
+		log.Infof("bt: Toggle zaraz po wyborze utworu - ignoruję")
+		return
+	}
+	// po (ponownym) połączeniu radio samo wysyła Toggle i wybór bieżącego utworu -
+	// bez zgadywania Next (Next+Previous cofałoby utwór na początek)
+	if time.Since(b.connectedAt) < startupWindow {
+		b.lastToggle = time.Now()
+		b.spec = false
+		b.mu.Unlock()
+		log.Infof("bt: Toggle w sekwencji startowej radia - bez zgadywania")
+		return
+	}
+	t := time.Now()
+	b.lastToggle = t
+	b.radioPaused = !b.radioPaused
+	paused := b.radioPaused
+	writeRadioState(paused)
+	if b.toggleTimer != nil {
+		b.toggleTimer.Stop()
+		b.toggleTimer = nil
+	}
+	// wznowienie z pauzy - bez zgadywania
+	if !paused {
+		b.spec = false
+		b.mu.Unlock()
+		b.call("Play")
+		return
+	}
+	b.spec = true
+	b.specSent = false
+	if b.nextTimer != nil {
+		b.nextTimer.Stop()
+	}
+	b.nextTimer = time.AfterFunc(specDelay, func() { b.sendSpecNext(t) })
+	b.toggleTimer = time.AfterFunc(specTimeout, func() { b.undoSpec(t) })
+	b.mu.Unlock()
+	log.Infof("bt: Toggle - za chwilę Next na zgadywanie")
+}
+
+// sendSpecNext: po specDelay radio nie zapytało o stan - to raczej zmiana utworu, wysyłamy Next
+func (b *btBridge) sendSpecNext(t time.Time) {
+	b.mu.Lock()
+	if !b.lastToggle.Equal(t) || !b.spec || b.specSent {
+		b.mu.Unlock()
+		return
+	}
+	b.specSent = true
+	b.nextTimer = nil
+	b.mu.Unlock()
+	log.Infof("bt: Next na zgadywanie")
+	b.call("Next")
+}
+
+// onPlayStatusQuery: radio pyta o stan (GetPlayStatus). Jeśli zaraz po Toggle - to pauza.
+func (b *btBridge) onPlayStatusQuery() {
+	b.mu.Lock()
+	if !b.spec || time.Since(b.lastToggle) > specTimeout {
+		b.mu.Unlock()
+		return
+	}
+	sent := b.specSent
+	b.spec = false
+	b.specSent = false
+	if b.nextTimer != nil {
+		b.nextTimer.Stop()
+		b.nextTimer = nil
+	}
+	if b.toggleTimer != nil {
+		b.toggleTimer.Stop()
+		b.toggleTimer = nil
+	}
+	b.mu.Unlock()
+	if !sent {
+		log.Infof("bt: radio pyta o stan po Toggle - to pauza (bez zgadywania)")
+		b.call("Pause")
+		return
+	}
+	log.Infof("bt: radio pyta o stan po Toggle - to pauza, cofam Next")
+	b.callSeqGap(prevGap, "Previous", "Pause")
+}
+
+// undoSpec: po Toggle nie przyszedł wybór utworu, więc to była pauza -
+// wracamy do poprzedniego utworu i pauzujemy. Nic nie robi, jeśli w
+// międzyczasie był wybór utworu (selectIndex zeruje lastToggle) albo kolejny Toggle.
+func (b *btBridge) undoSpec(t time.Time) {
+	b.mu.Lock()
+	if !b.lastToggle.Equal(t) || !b.spec {
+		b.mu.Unlock()
+		return
+	}
+	sent := b.specSent
+	b.spec = false
+	b.specSent = false
+	b.toggleTimer = nil
+	b.mu.Unlock()
+	if !sent {
+		b.call("Pause")
+		return
+	}
+	log.Infof("bt: brak wyboru utworu - to była pauza, cofam Next")
+	b.callSeqGap(prevGap, "Previous", "Pause")
+}
+
+// Radio liczy "następny" jako (indeks+1) mod liczba utworów, więc porównujemy
+// z poprzednim indeksem z uwzględnieniem zawijania listy.
+func (b *btBridge) selectIndex(idx int32) {
+	b.mu.Lock()
+	// radio potrafi wysłać ten sam wybór kilka razy pod rząd (co ~5 ms) - duplikaty pomijamy
+	if idx == b.curIndex && !b.lastSelect.IsZero() && time.Since(b.lastSelect) < 500*time.Millisecond {
+		b.mu.Unlock()
+		log.Infof("bt: duplikat wyboru #%d - pomijam", idx)
+		return
+	}
+	cur := b.curIndex
+	fresh := b.fresh
+	b.fresh = false
+	// zmiana utworu z kierownicy zawsze ma przed sobą Toggle; wybory bez niego
+	// (start radia, powrót do "ostatniego" utworu po podłączeniu) tylko wznawiają
+	userSkip := !b.lastToggle.IsZero() && time.Since(b.lastToggle) < 2500*time.Millisecond
+	spec := b.spec && b.specSent
+	b.spec = false
+	b.specSent = false
+	if b.nextTimer != nil {
+		b.nextTimer.Stop()
+		b.nextTimer = nil
+	}
+	if b.toggleTimer != nil {
+		b.toggleTimer.Stop()
+		b.toggleTimer = nil
+	}
+	b.lastToggle = time.Time{}
+	b.curIndex = idx
+	b.lastSelect = time.Now()
+	b.radioPaused = false
+	writeRadioState(false)
+	b.mu.Unlock()
+	if fresh || !userSkip {
+		log.Infof("bt: wybór #%d bez przycisku (start radia) - tylko Play", idx)
+		b.call("Play")
+		return
+	}
+	diff := ((idx-cur)%fakeTrackCount + fakeTrackCount) % fakeTrackCount
+	next := diff == 1 || (diff != 0 && diff != fakeTrackCount-1 && diff <= fakeTrackCount/2)
+	switch {
+	case spec && next:
+		log.Infof("bt: zgadywanie trafione (Next)")
+		b.call("Play")
+	case spec && diff == 0:
+		b.callSeqGap(prevGap, "Previous", "Play")
+	case spec:
+		log.Infof("bt: zgadywanie chybione - Previous x2")
+		b.callSeqGap(prevGap, "Previous", "Previous", "Play")
+	case diff == 0:
+		b.call("Play")
+	case next:
+		b.callSeq("Next", "Play")
+	default:
+		b.callSeq("Previous", "Play")
+	}
+}
+
+func (b *btBridge) setRadioPaused(p bool) {
+	b.mu.Lock()
+	b.radioPaused = p
+	writeRadioState(p)
+	b.mu.Unlock()
+}
+
+func extAck(req *ipod.Command, tr ipod.CommandWriter) {
+	ipod.Respond(req, tr, &extremote.ACK{Status: extremote.ACKStatusSuccess, CmdID: req.ID.CmdID()})
+}
+
+// handleExtRemoteBT obsługuje to, co trzeba przekazać do iPhone'a; zwraca false,
+// jeśli komendę ma obsłużyć domyślny handler.
+func handleExtRemoteBT(req *ipod.Command, tr ipod.CommandWriter) bool {
+	switch msg := req.Payload.(type) {
+	case *extremote.PlayControl:
+		log.Infof("radio: PlayControl 0x%02x", byte(msg.Cmd))
+		switch msg.Cmd {
+		case extremote.PlayControlNextTrack, extremote.PlayControlNext:
+			bt.call("Next")
+		case extremote.PlayControlPrevTrack, extremote.PlayControlPrev:
+			bt.call("Previous")
+		case extremote.PlayControlPlay:
+			bt.setRadioPaused(false)
+			bt.call("Play")
+		case extremote.PlayControlPause, extremote.PlayControlStop:
+			bt.setRadioPaused(true)
+			bt.call("Pause")
+		case extremote.PlayControlToggle:
+			bt.handleToggle()
+		}
+		extAck(req, tr)
+	case *extremote.SetCurrentPlayingTrack:
+		log.Infof("radio: SetCurrentPlayingTrack %d", msg.TrackIndex)
+		bt.selectIndex(msg.TrackIndex)
+		extAck(req, tr)
+	case *extremote.PlayCurrentSelection:
+		log.Infof("radio: PlayCurrentSelection %d", msg.SelectedTrackIndex)
+		bt.selectIndex(msg.SelectedTrackIndex)
+		extAck(req, tr)
+	case *extremote.SetPlayStatusChangeNotificationShort:
+		log.Infof("radio: powiadomienia = %v", msg.Enabled)
+		bt.mu.Lock()
+		bt.notifyOn = msg.Enabled
+		bt.mu.Unlock()
+		extAck(req, tr)
+	case *extremote.SetPlayStatusChangeNotification:
+		bt.mu.Lock()
+		bt.notifyOn = msg.EventMask != 0
+		bt.mu.Unlock()
+		extAck(req, tr)
+	case *extremote.GetNumberCategorizedDBRecords:
+		// 3 utwory (kategoria 5), ale tylko 1 playlista/wykonawca/album itd.,
+		// żeby radio nie przeglądało wielu kombinacji przy potwierdzaniu mediów
+		cnt := int32(1)
+		if msg.CategoryType == 5 {
+			cnt = fakeTrackCount
+		}
+		log.Infof("radio: GetNumberDB cat=%d -> %d", msg.CategoryType, cnt)
+		ipod.Respond(req, tr, &extremote.ReturnNumberCategorizedDBRecords{RecordCount: cnt})
+	case *extremote.RetrieveCategorizedDatabaseRecords:
+		// odpowiadamy dokładnie tyle rekordów, ile radio prosi (reszta bazy)
+		off := int32(msg.Offset)
+		n := msg.Count
+		// radio czyta też "za końcem" bazy; zawsze odsyłamy co najmniej jeden
+		// rekord, inaczej czeka w nieskończoność (tak robił oryginalny klient)
+		if n < 0 {
+			n = fakeTrackCount - off
+		}
+		if n < 1 {
+			n = 1
+		}
+		if n > fakeTrackCount {
+			n = fakeTrackCount
+		}
+		if msg.CategoryType != 5 && n > 1 {
+			n = 1
+		}
+		log.Infof("radio: RetrieveDB cat=%d off=%d count=%d -> %d", msg.CategoryType, msg.Offset, msg.Count, n)
+		for i := int32(0); i < n; i++ {
+			rec := &extremote.ReturnCategorizedDatabaseRecord{RecordCategoryIndex: uint32(off + i)}
+			name := dbName(byte(msg.CategoryType))
+			if labelTest {
+				name = fmt.Sprintf("DB%d#%d", msg.CategoryType, off+i)
+			}
+			rec.String = ipod.StringToBytes(name)
+			ipod.Respond(req, tr, rec)
+		}
+	case *extremote.GetNumPlayingTracks:
+		ipod.Respond(req, tr, &extremote.ReturnNumPlayingTracks{NumTracks: fakeTrackCount})
+	case *extremote.GetPlayStatus:
+		bt.onPlayStatusQuery()
+		t := bt.track()
+		pos, _ := bt.status()
+		bt.mu.Lock()
+		paused := bt.radioPaused
+		bt.mu.Unlock()
+		// radiu podajemy jego własny stan (a nie iPhone'a), żeby nie zamykało
+		// strumienia audio USB, gdy iPhone na chwilę pauzuje przy zmianie utworu
+		state := extremote.PlayerStatePlaying
+		if paused {
+			state = extremote.PlayerStatePaused
+		}
+		// długość z zapasem 10 min: radio po przełączeniu może znać długość poprzedniego
+		// utworu i "kończyć" bieżący przed czasem; do następnego utworu iPhone przejdzie sam
+		ipod.Respond(req, tr, &extremote.ReturnPlayStatus{TrackLength: t.Duration + 600000, TrackPosition: pos, State: state})
+	case *extremote.GetIndexedPlayingTrackTitle:
+		t := bt.cachedTrack()
+		log.Infof("radio: pyta o tytuł #%d -> %q", msg.TrackIndex, t.Title)
+		ipod.Respond(req, tr, &extremote.ReturnIndexedPlayingTrackTitle{Title: ipod.StringToBytes(label("T:", screenTitle))})
+	case *extremote.GetIndexedPlayingTrackArtistName:
+		t := bt.cachedTrack()
+		log.Infof("radio: pyta o wykonawcę #%d -> %q", msg.TrackIndex, t.Artist)
+		ipod.Respond(req, tr, &extremote.ReturnIndexedPlayingTrackArtistName{ArtistName: ipod.StringToBytes(label("A:", screenArtist))})
+	case *extremote.GetIndexedPlayingTrackAlbumName:
+		t := bt.cachedTrack()
+		log.Infof("radio: pyta o album #%d -> %q", msg.TrackIndex, t.Album)
+		ipod.Respond(req, tr, &extremote.ReturnIndexedPlayingTrackAlbumName{AlbumName: ipod.StringToBytes(label("L:", screenAlbum))})
+	case *extremote.GetCurrentPlayingTrackIndex:
+		bt.mu.Lock()
+		idx := bt.curIndex
+		bt.mu.Unlock()
+		log.Infof("radio: pyta o bieżący numer -> %d", idx)
+		ipod.Respond(req, tr, &extremote.ReturnCurrentPlayingTrackIndex{TrackIndex: idx})
+	case *extremote.GetIndexedPlayingTrackInfo:
+		log.Infof("radio: pyta o info #%d typ %d", msg.TrackIndex, msg.InfoType)
+		if msg.InfoType == extremote.TrackInfoGenre || msg.InfoType == extremote.TrackInfoComposer || msg.InfoType == extremote.TrackInfoPodcastName {
+			ipod.Respond(req, tr, &extremote.ReturnIndexedPlayingTrackInfo{
+				InfoType: msg.InfoType,
+				Info:     ipod.StringToBytes(label("G:", "Bluetooth")),
+			})
+			return true
+		}
+		return false
+	default:
+		log.Debugf("radio: inne %T", msg)
+		return false
+	}
+	return true
+}

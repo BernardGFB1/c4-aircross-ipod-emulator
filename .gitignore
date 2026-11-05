@@ -1,4 +1,4 @@
-# .gitignore v1 (2026-11-05)
+# .gitignore v2 (2026-11-05) - usunięte wpisy ipod/CMD itd.: na Macu (bez rozróżniania wielkości liter) ignorowały cały katalog ipod/cmd
 # artefakty kompilacji
 ipod/ipod
 ipod/ipod.v*
@@ -9,10 +9,6 @@ ipod-gadget/gadget/*.mod.c
 ipod-gadget/gadget/.*.cmd
 ipod-gadget/gadget/modules.order
 ipod-gadget/gadget/Module.symvers
-# śmieci z logowania klienta iAP
-ipod/CMD
-ipod/FRAME
-ipod/PACKET
 # lokalne ustawienia z prawdziwymi adresami
 system/config/c4-aircross-ipod
 .DS_Store

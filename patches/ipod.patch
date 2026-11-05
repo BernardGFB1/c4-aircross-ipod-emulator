@@ -1,10 +1,10 @@
 diff --git a/cmd/ipod/bt.go b/cmd/ipod/bt.go
 new file mode 100644
-index 0000000..961d9a5
+index 0000000..9d8ab9a
 --- /dev/null
 +++ b/cmd/ipod/bt.go
-@@ -0,0 +1,704 @@
-+// bt.go v24 (2026-11-05) - mostek radio <-> iPhone (v23 + ustawienia z /etc/default/c4-aircross-ipod)
+@@ -0,0 +1,727 @@
++// bt.go v25 (2026-11-05) - mostek radio <-> iPhone (v24 + plik stanu radia dla samonaprawy Bluetooth)
 +package main
 +
 +// Most między radiem (iAP, lingo ExtRemote) a iPhonem (Bluetooth AVRCP przez BlueZ).
@@ -98,7 +98,7 @@ index 0000000..961d9a5
 +	radioPaused bool // stan odtwarzania z punktu widzenia radia
 +	notifyOn    bool // radio włączyło powiadomienia o zmianie stanu
 +	lastTrack   string
-+	lastPos     uint32    // ostatnia pozycja wysłana radiu (ms) - do wykrywania przewijania
++	lastPos     uint32 // ostatnia pozycja wysłana radiu (ms) - do wykrywania przewijania
 +	lastPosAt   time.Time
 +	cached      trackInfo // ostatni znany utwór z iPhone'a (odświeżany w tle)
 +	fresh       bool      // nowe połączenie z radiem: pierwszy wybór utworu nie przełącza
@@ -137,8 +137,28 @@ index 0000000..961d9a5
 +	bt.mu.Lock()
 +	bt.fresh = true
 +	bt.connectedAt = time.Now()
++	// do pierwszego wyboru utworu radio jeszcze nie chce dźwięku (samonaprawa ma wtedy czekać)
++	writeRadioState(true)
 +	bt.mu.Unlock()
 +	log.Infof("bt: radio przedstawiło się od nowa - sekwencja startowa")
++}
++
++// Stan radia dla bt-autoconnect.sh: "playing", gdy radio chce grać (ostatnie polecenie z radia),
++// "paused" w przeciwnym razie. Brak pliku = brak radia (usługa ipod-gadget zatrzymana).
++// Samonaprawa Bluetooth opiera się na tym, czego chce radio, a nie na tym, co zgłasza iPhone.
++var radioStateFile = envOr("IPOD_STATE_FILE", "/run/c4-aircross-ipod/radio-state")
++
++// writeRadioState zapisuje stan atomowo (plik tymczasowy + rename); wywoływać pod b.mu.
++func writeRadioState(paused bool) {
++	st := "playing\n"
++	if paused {
++		st = "paused\n"
++	}
++	tmp := radioStateFile + ".tmp"
++	if err := os.WriteFile(tmp, []byte(st), 0644); err != nil {
++		return
++	}
++	os.Rename(tmp, radioStateFile)
 +}
 +
 +func sendNotify(payload []byte) bool {
@@ -426,6 +446,7 @@ index 0000000..961d9a5
 +	b.lastToggle = t
 +	b.radioPaused = !b.radioPaused
 +	paused := b.radioPaused
++	writeRadioState(paused)
 +	if b.toggleTimer != nil {
 +		b.toggleTimer.Stop()
 +		b.toggleTimer = nil
@@ -543,6 +564,7 @@ index 0000000..961d9a5
 +	b.curIndex = idx
 +	b.lastSelect = time.Now()
 +	b.radioPaused = false
++	writeRadioState(false)
 +	b.mu.Unlock()
 +	if fresh || !userSkip {
 +		log.Infof("bt: wybór #%d bez przycisku (start radia) - tylko Play", idx)
@@ -572,6 +594,7 @@ index 0000000..961d9a5
 +func (b *btBridge) setRadioPaused(p bool) {
 +	b.mu.Lock()
 +	b.radioPaused = p
++	writeRadioState(p)
 +	b.mu.Unlock()
 +}
 +
