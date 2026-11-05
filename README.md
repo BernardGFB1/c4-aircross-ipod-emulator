@@ -1,16 +1,15 @@
 <!-- README.md v1 (2026-11-05) -->
 # Emulator iPoda dla radia Citroëna C4 Aircross
 
+
 Raspberry Pi Zero 2W podłączone kablem USB do fabrycznego radia udaje iPoda,
 a iPhone wysyła do niego muzykę przez Bluetooth. Radio myśli, że gra z iPoda,
 więc przyciski na kierownicy i ekran działają jak z prawdziwym iPodem.
 
-**Po co:** wbudowany Bluetooth radia ma ~3 s opóźnienia przy każdej zmianie utworu i słabą jakość.
-Przez emulator „następny” przełącza od razu, a dźwięk idzie w AAC.
+**Po co:** wbudowany Bluetooth w radiu ma ~3 s opóźnienia przy każdej zmianie utworu i słabą jakość dzwięku.
+Przez emulator przycisk „następny utwór” działa od razu, a dźwięk jest przesyłany w formacie AAC.
 
-Testowane w Citroënie C4 Aircross 2013. Radio jest bliźniakiem tego z Mitsubishi ASX,
-więc to powinno działać też tam, ale tego nie sprawdzałem.
-
+Testowane w Citroënie C4 Aircross 2013. Radio jest bliźniakiem z radiem w Mitsubishi ASX (wersja radia C11)
 ```
 iPhone ──Bluetooth (AAC/A2DP + AVRCP)──▶ Pi Zero 2W ──USB (iAP + USB Audio, bezstratnie)──▶ radio
        ◀──────── przyciski z kierownicy (radio → iAP → Pi → AVRCP → iPhone) ─────────────
