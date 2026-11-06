@@ -1,5 +1,14 @@
 #!/bin/bash
-# bt-autoconnect.sh v10 (2026-11-06) - łączy iPhone'a z Pi i sam naprawia dźwięk z Bluetooth.
+# bt-autoconnect.sh v12 (2026-11-06) - łączy iPhone'a z Pi i sam naprawia dźwięk z Bluetooth.
+# v12: pauza na telefonie jest szanowana. Radio nie ma przycisku pauzy, więc pauzuje się na iPhonie,
+#      a radio dalej "chce grać" - v9-v11 brały to za awarię i po 30-120 s wznawiały muzykę.
+#      Teraz: połączenie działa + iPhone zgłasza pauzę = decyzja użytkownika, nic nie robimy.
+#      Play wysyłamy tylko (a) po powrocie zerwanego połączenia, jeśli tuż przed zerwaniem grało
+#      (iOS sam pauzuje, gdy znika mu głośnik Bluetooth), albo (b) gdy iPhone gra, a dźwięk nie płynie.
+# v11: co ~20 s pytamy układ Bluetooth o wersję (hciconfig hci0 version). Po nagłym zerwaniu łącza
+#      (wyjście z zasięgu, zakłócenia w aucie) układ potrafi się zawiesić: nie odpowiada na polecenia,
+#      a jądro dalej pokazuje iPhone'a jako połączonego. Dwa brak odpowiedzi z rzędu = od razu krok 3
+#      (przeładowanie hci_uart resetuje układ), bez względu na stan radia.
 # v10: "dźwięk przychodzi" = dane z iPhone'a faktycznie trafiają na kartę USB radia (rośnie appl_ptr);
 #      bluealsa PCM1.Running zostawało true, gdy łącze radiowe stało. Po ponownym połączeniu (krok 2 i 3)
 #      wysyłamy Play - iOS pauzuje muzykę, gdy wyjście Bluetooth zniknie, i sam jej nie wznawia.
@@ -76,15 +85,15 @@ diag() {
 heal() {
   local i
   case $1 in
-    1) log "samonaprawa 1: Play do iPhone'a i łączę profil audio"
-       play_when_ready
+    1) log "samonaprawa 1: łączę profil audio (Play: $RESUME)"
+       [ "$RESUME" = 1 ] && play_when_ready
        btctl connect $MAC $A2DP_SRC >/dev/null ;;
-    2) log "samonaprawa 2: rozłączam iPhone'a, łączę od nowa i wysyłam Play"
+    2) log "samonaprawa 2: rozłączam iPhone'a, łączę od nowa (Play: $RESUME)"
        btctl disconnect $MAC >/dev/null; sleep 3
        btctl connect $MAC >/dev/null; sleep 2
        btctl connect $MAC $A2DP_SRC >/dev/null
-       play_when_ready ;;
-    3) log "samonaprawa 3: restart całego Bluetooth (bluetoothd, sterownik hci_uart, bluealsa), połączenie i Play"
+       [ "$RESUME" = 1 ] && play_when_ready ;;
+    3) log "samonaprawa 3: restart całego Bluetooth (bluetoothd, sterownik hci_uart, bluealsa), połączenie (Play: $RESUME)"
        systemctl stop bluetooth
        modprobe -r hci_uart 2>/dev/null; sleep 2; modprobe hci_uart; sleep 5
        systemctl restart bluetooth; sleep 3
@@ -93,12 +102,21 @@ heal() {
        for i in $(seq 1 30); do btctl show | grep -q "Audio Sink" && break; sleep 1; done
        btctl connect $MAC >/dev/null; sleep 2
        btctl connect $MAC $A2DP_SRC >/dev/null
-       play_when_ready ;;
+       [ "$RESUME" = 1 ] && play_when_ready ;;
   esac
 }
 
+# układ Bluetooth odpowiada na polecenie HCI (Read Local Version)?
+controller_alive() { timeout 8 hciconfig hci0 version 2>&1 | grep -q "HCI Version"; }
+
 until btctl show | grep -q "Audio Sink"; do sleep 1; done
 noaudio=0; last_ok=$(date +%s); stage=0; cooldown_until=0
+probe_n=0; probe_fail=0
+# start Pi (odpalenie auta) traktujemy jak powrót po zerwaniu, kiedy grało: iOS pauzuje muzykę przy
+# zgaszeniu auta, a po starcie ma grać sama (mostek też wysyła wtedy Play - podwójne nie szkodzi)
+trouble=0; resume=0; last_playing_at=$(date +%s); RESUME=0
+# grało w ciągu ostatnich 10 s? (iOS pauzuje sekundę-dwie przed zamknięciem połączenia audio)
+was_playing() { [ $(( $(date +%s) - last_playing_at )) -le 10 ]; }
 while true; do
   now=$(date +%s)
   # adapter z niewłaściwym adresem = iPhone go "nie zna" (sparowany z $ADAPTER)
@@ -107,8 +125,47 @@ while true; do
     log "adapter ma adres $addr zamiast $ADAPTER"
   fi
 
+  # czy układ Bluetooth w ogóle żyje (co ~20 s)
+  probe_n=$((probe_n+1))
+  if [ $probe_n -ge 7 ]; then
+    probe_n=0
+    if controller_alive; then
+      probe_fail=0
+    else
+      probe_fail=$((probe_fail+1))
+      log "układ Bluetooth nie odpowiada na polecenia ($probe_fail/2)"
+      if [ $probe_fail -ge 2 ]; then
+        diag
+        RESUME=0; was_playing && radio_wants_audio && RESUME=1
+        heal 3
+        probe_fail=0
+        continue
+      fi
+    fi
+  fi
+
+  # stan połączenia audio i odtwarzacza iPhone'a
+  t=$(obj 'sep[0-9]+/fd[0-9]+'); p=$(obj 'player[0-9]+')
+  pstatus=$( [ -n "$p" ] && prop "$p" org.bluez.MediaPlayer1 Status)
+  if [ -n "$t" ]; then
+    if [ $trouble -eq 1 ]; then
+      trouble=0
+      if [ $resume -eq 1 ] && radio_wants_audio; then
+        log "połączenie audio z iPhone'em wróciło - przed zerwaniem grało, wysyłam Play"
+        play_when_ready
+      else
+        log "połączenie audio z iPhone'em wróciło"
+      fi
+      resume=0
+    fi
+    [ "$pstatus" = "playing" ] && last_playing_at=$now
+  elif [ $trouble -eq 0 ]; then
+    trouble=1; resume=0; was_playing && resume=1
+    log "połączenie audio z iPhone'em zerwane (grało: $resume)"
+  fi
+
   # utrzymanie połączenia
-  if [ -z "$(obj 'sep[0-9]+/fd[0-9]+')" ]; then
+  if [ -z "$t" ]; then
     if ! btctl info $MAC | grep -q "Connected: yes"; then
       btctl connect $MAC >/dev/null
       noaudio=0
@@ -125,8 +182,11 @@ while true; do
     noaudio=0
   fi
 
-  # samonaprawa: radio chce grać, a dźwięku z iPhone'a nie ma
-  if ! radio_wants_audio || audio_flowing; then
+  # samonaprawa: radio chce grać, a dźwięku z iPhone'a nie ma - chyba że to pauza na telefonie
+  # (połączenie działa, iPhone zgłasza pauzę/stop) - wtedy to decyzja użytkownika
+  user_pause=0
+  [ -n "$t" ] && [ $trouble -eq 0 ] && [ -n "$pstatus" ] && [ "$pstatus" != "playing" ] && user_pause=1
+  if ! radio_wants_audio || [ $user_pause -eq 1 ] || audio_flowing; then
     if [ $stage -gt 0 ]; then log "dźwięk z iPhone'a wrócił (po samonaprawie $stage)"; fi
     stage=0; last_ok=$now
   elif [ $now -ge $cooldown_until ]; then
@@ -142,6 +202,7 @@ while true; do
     fi
     if [ $next -gt 0 ]; then
       diag
+      RESUME=0; { [ "$pstatus" = "playing" ] || [ $resume -eq 1 ]; } && RESUME=1
       heal $next
       stage=$next
     fi

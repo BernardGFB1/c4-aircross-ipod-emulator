@@ -1,4 +1,4 @@
-<!-- protokol-radia.md v3 (2026-11-06) -->
+<!-- protokol-radia.md v4 (2026-11-06) -->
 # Jak radio C4 Aircross rozmawia z „iPodem”
 
 Ustalenia z logów zebranych podczas budowy emulatora (wrzesień–listopad 2026). Radio:
@@ -167,3 +167,13 @@ Wszystko poniżej to obserwacje z tego jednego radia. Inne radia z iAP mogą si�
   w logach nie ma. Strumień bluealsa ma wtedy nadal `Running=true`, dlatego samonaprawa (v10) sprawdza,
   czy dane faktycznie trafiają na kartę USB (`appl_ptr`). Zawieszony układ resetuje jej krok 3
   (przeładowanie `hci_uart`).
+- **Zawieszony układ Bluetooth odtworzony w domu** (6.11): wystarczyło wyjść z telefonem poza zasięg.
+  Po powrocie iPhone nie mógł się połączyć, jądro dalej pokazywało go jako połączonego, a układ nie
+  odpowiadał na `hciconfig hci0 version` („Connection timed out”). Przeładowanie `hci_uart` przywróciło
+  działanie, a iPhone połączył się sam w ~30 s. Wyzwalaczem jest więc nagłe zerwanie łącza, a w aucie
+  najpewniej zakłócenia. `bt-autoconnect` (v11) pyta układ o wersję co ~20 s i po dwóch brakach
+  odpowiedzi resetuje go od razu.
+- **Radio nie ma przycisku pauzy,** więc pauzuje się na telefonie, a radio dalej „chce grać”.
+  Samonaprawa (v12) uznaje pauzę na telefonie przy działającym połączeniu za decyzję użytkownika.
+  Play wysyła tylko po powrocie zerwanego połączenia, jeśli tuż przed zerwaniem grało (iOS sam pauzuje,
+  gdy znika mu głośnik Bluetooth), albo gdy iPhone zgłasza granie, a dźwięk nie płynie.
