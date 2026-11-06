@@ -1,4 +1,4 @@
-<!-- aac.md v1 (2026-11-05) -->
+<!-- aac.md v2 (2026-11-06) -->
 # AAC zamiast SBC
 
 iPhone wysyła dźwięk przez Bluetooth w jednym z dwóch kodeków: **SBC** albo **AAC**. Oba są
@@ -29,6 +29,9 @@ sudo make install
 `libfdk-aac-dev` jest w repozytorium `non-free`, włączonym domyślnie w Raspberry Pi OS.
 
 Sprawdzenie: w sekcji kodeków `/usr/local/bin/bluealsa --help` muszą być `SBC, AAC`.
+
+Wersja z `/usr/local` zapisuje ustawienia (np. głośność) w `/usr/local/var/lib/bluealsa`. Utwórz ten katalog,
+inaczej w logu pojawia się „Couldn't save storage”: `sudo mkdir -p /usr/local/var/lib/bluealsa`.
 
 `make install` nadpisuje przy okazji wtyczki ALSA `libasound_module_{ctl,pcm}_bluealsa`
 i `/usr/share/dbus-1/system.d/bluealsa.conf` z pakietu Debiana. To ta sama wersja,

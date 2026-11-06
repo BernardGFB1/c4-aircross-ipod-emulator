@@ -1,0 +1,14 @@
+# wifi-car-mode.service v1 (2026-11-06) - Wi-Fi wyłączone, gdy Pi jest podłączone do radia
+[Unit]
+Description=Turn Wi-Fi off while connected to the car radio
+After=NetworkManager.service ipod-gadget.service
+
+[Service]
+ExecStart=/usr/local/bin/wifi-car-mode.sh
+# na wszelki wypadek: po zatrzymaniu usługi Wi-Fi zawsze wraca (stan nmcli jest trwały)
+ExecStopPost=/usr/bin/nmcli radio wifi on
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

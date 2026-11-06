@@ -1,4 +1,4 @@
-<!-- protokol-radia.md v2 (2026-11-05) -->
+<!-- protokol-radia.md v3 (2026-11-06) -->
 # Jak radio C4 Aircross rozmawia z „iPodem”
 
 Ustalenia z logów zebranych podczas budowy emulatora (wrzesień–listopad 2026). Radio:
@@ -159,3 +159,11 @@ Wszystko poniżej to obserwacje z tego jednego radia. Inne radia z iAP mogą si�
   o pozycji zapytało o stan i wysłało Toggle, co mostek wziął za kliknięcie. Hipoteza: radio
   reaguje na nagłe cofnięcie pozycji. Mostek v23 zapisuje skoki pozycji w logu, żeby to potwierdzić.
 - **Przyczyna zerwań USB:** wspólna masa / dwa zasilania czy zakłócenia na kablu danych.
+- **Zawieszanie się łącza Bluetooth w trakcie jazdy** (6.11): najpierw gubione pakiety audio
+  (`Missing RTP packets`), iOS pauzuje muzykę i przełącza dźwięk na głośnik, a na końcu
+  `hci0: link tx timeout` / `command 0x0406 tx timeout`, czyli zawieszony układ Bluetooth Pi. Według
+  obserwacji zdarza się przy przyspieszaniu na konkretnych obrotach (między 2. a 3. biegiem). Podejrzane:
+  zakłócenia z instalacji albo drgania (luźne wtyczki), skanowanie Wi-Fi. Ostrzeżeń o niskim napięciu
+  w logach nie ma. Strumień bluealsa ma wtedy nadal `Running=true`, dlatego samonaprawa (v10) sprawdza,
+  czy dane faktycznie trafiają na kartę USB (`appl_ptr`). Zawieszony układ resetuje jej krok 3
+  (przeładowanie `hci_uart`).

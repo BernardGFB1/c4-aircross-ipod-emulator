@@ -1,4 +1,4 @@
-<!-- README.md v2 (2026-11-05) -->
+<!-- README.md v3 (2026-11-06) -->
 # Emulator iPoda dla radia Citroëna C4 Aircross
 
 
@@ -149,8 +149,15 @@ ExecStart=/usr/bin/bluealsa -p a2dp-sink
 sudo install -m 755 system/scripts/*.sh /usr/local/bin/
 sudo install -m 644 system/systemd/*.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now bluealsa ipod-gadget bt-to-ipod bt-autoconnect usb-audio-watchdog
+sudo systemctl enable --now bluealsa ipod-gadget bt-to-ipod bt-autoconnect usb-audio-watchdog wifi-car-mode
 ```
+
+`wifi-car-mode` wyłącza Wi-Fi, gdy Pi jest podłączone do radia, i włącza je po minucie bez radia.
+Wi-Fi i Bluetooth w Pi Zero 2W dzielą jeden układ i antenę, a w aucie Pi szuka sieci i zabiera
+antenę Bluetooth. Jeśli chcesz mieć Pi w sieci także w aucie (np. przez hotspot), nie włączaj tej usługi.
+
+Jeśli nazwa systemu wraca po restarcie do tej z obrazu, nadpisuje ją cloud-init. Zmień `hostname:`
+w `/boot/firmware/user-data` i skopiuj `system/config/cloud.cfg.d/99-c4-aircross.cfg` do `/etc/cloud/cloud.cfg.d/`.
 
 Opcjonalnie trwały dziennik, który przetrwa utratę zasilania (bardzo pomaga w diagnozie):
 

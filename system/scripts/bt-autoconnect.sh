@@ -1,16 +1,19 @@
 #!/bin/bash
-# bt-autoconnect.sh v9 (2026-11-05) - łączy iPhone'a z Pi i sam naprawia dźwięk z Bluetooth.
+# bt-autoconnect.sh v10 (2026-11-06) - łączy iPhone'a z Pi i sam naprawia dźwięk z Bluetooth.
+# v10: "dźwięk przychodzi" = dane z iPhone'a faktycznie trafiają na kartę USB radia (rośnie appl_ptr);
+#      bluealsa PCM1.Running zostawało true, gdy łącze radiowe stało. Po ponownym połączeniu (krok 2 i 3)
+#      wysyłamy Play - iOS pauzuje muzykę, gdy wyjście Bluetooth zniknie, i sam jej nie wznawia.
 #
 # Zasada: jeśli radio chce grać (źródło iPod, ostatnie polecenie z radia = graj), a z iPhone'a
 # przez 30 s nie przychodzi dźwięk - naprawiamy, bez względu na to, co zgłasza iPhone.
 #   1. (30 s)  Play do iPhone'a + połączenie profilu audio
-#   2. (60 s)  rozłączenie iPhone'a i połączenie od nowa
-#   3. (120 s) restart całego Bluetooth w Pi (bluetoothd, sterownik, bluealsa)
+#   2. (60 s)  rozłączenie iPhone'a, połączenie od nowa, Play
+#   3. (120 s) restart całego Bluetooth w Pi (bluetoothd, sterownik, bluealsa), połączenie, Play
 # Po trzech nieudanych krokach przerwa 5 min (np. iPhone poza autem albo z wyłączonym Bluetooth).
 #
 # Stan radia zapisuje mostek (bt.go): /run/c4-aircross-ipod/radio-state = playing | paused.
 # "Radio chce grać" = plik mówi playing i radio ma włączone audio USB (ostatnio "audio start").
-# "Dźwięk przychodzi" = strumień bluealsa z iPhone'a pracuje (org.bluealsa.PCM1.Running = true).
+# "Dźwięk przychodzi" = bt-to-ipod zapisuje dane na kartę iPodUSB (appl_ptr rośnie między sprawdzeniami).
 #
 # Oprócz tego, jak w poprzednich wersjach: łączy iPhone'a, gdy nie jest połączony, a gdy jest
 # połączony bez profilu audio, łączy sam profil Audio Source (iPhone potrafi odrzucić pierwszy
@@ -38,32 +41,59 @@ radio_wants_audio() {
   [ "$(cat "$STATE" 2>/dev/null)" = "playing" ] &&
     [ "$(dmesg | grep -oE "ipod-gadget-audio: audio (start|stop)" | tail -1)" = "ipod-gadget-audio: audio start" ]
 }
-audio_flowing() { [ "$(baprop Running)" = "true" ]; }
+CARD=/proc/asound/iPodUSB/pcm0p/sub0/status
+appl_ptr() { grep -oE "^appl_ptr *: *[0-9]+" $CARD 2>/dev/null | grep -oE "[0-9]+\$"; }
+last_appl=""
+audio_flowing() {
+  local a r=1
+  a=$(appl_ptr)
+  [ -n "$a" ] && [ -n "$last_appl" ] && [ "$a" != "$last_appl" ] && r=0
+  last_appl=$a
+  return $r
+}
+
+# Play do iPhone'a, gdy pojawi się jego odtwarzacz AVRCP (po ponownym połączeniu trwa to kilka sekund)
+play_when_ready() {
+  local p i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    p=$(obj 'player[0-9]+')
+    if [ -n "$p" ]; then
+      timeout 5 busctl call org.bluez "$p" org.bluez.MediaPlayer1 Play >/dev/null 2>&1 && return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
 
 # stan do logu w chwili problemu - żeby było widać przyczynę
 diag() {
   local info t p
   info=$(btctl info $MAC | grep -E "Paired|Trusted|Connected" | tr -s ' \t\n' ' ')
   t=$(obj 'sep[0-9]+/fd[0-9]+'); p=$(obj 'player[0-9]+')
-  log "diag: adapter: $(btctl show | awk '/^Controller/{print $2; exit}') | iPhone: ${info:-brak} | transport: ${t##*/} $( [ -n "$t" ] && prop "$t" org.bluez.MediaTransport1 State) | AVRCP: $( [ -n "$p" ] && prop "$p" org.bluez.MediaPlayer1 Status) | bluealsa: $(baprop Codec) running=$(baprop Running) | radio: $(cat "$STATE" 2>/dev/null)"
+  log "diag: adapter: $(btctl show | awk '/^Controller/{print $2; exit}') | iPhone: ${info:-brak} | transport: ${t##*/} $( [ -n "$t" ] && prop "$t" org.bluez.MediaTransport1 State) | AVRCP: $( [ -n "$p" ] && prop "$p" org.bluez.MediaPlayer1 Status) | bluealsa: $(baprop Codec) running=$(baprop Running) | karta USB: $(awk '/^state/{print $2}' $CARD 2>/dev/null || echo zamknięta) appl_ptr=$(appl_ptr) | radio: $(cat "$STATE" 2>/dev/null)"
 }
 
 heal() {
-  local p
+  local i
   case $1 in
     1) log "samonaprawa 1: Play do iPhone'a i łączę profil audio"
-       p=$(obj 'player[0-9]+')
-       [ -n "$p" ] && timeout 5 busctl call org.bluez "$p" org.bluez.MediaPlayer1 Play >/dev/null 2>&1
+       play_when_ready
        btctl connect $MAC $A2DP_SRC >/dev/null ;;
-    2) log "samonaprawa 2: rozłączam iPhone'a i łączę od nowa"
+    2) log "samonaprawa 2: rozłączam iPhone'a, łączę od nowa i wysyłam Play"
        btctl disconnect $MAC >/dev/null; sleep 3
-       btctl connect $MAC >/dev/null ;;
-    3) log "samonaprawa 3: restart całego Bluetooth (bluetoothd, sterownik hci_uart, bluealsa)"
+       btctl connect $MAC >/dev/null; sleep 2
+       btctl connect $MAC $A2DP_SRC >/dev/null
+       play_when_ready ;;
+    3) log "samonaprawa 3: restart całego Bluetooth (bluetoothd, sterownik hci_uart, bluealsa), połączenie i Play"
        systemctl stop bluetooth
        modprobe -r hci_uart 2>/dev/null; sleep 2; modprobe hci_uart; sleep 5
        systemctl restart bluetooth; sleep 3
        systemctl restart bluealsa; sleep 2
-       systemctl restart bt-to-ipod ;;
+       systemctl restart bt-to-ipod
+       for i in $(seq 1 30); do btctl show | grep -q "Audio Sink" && break; sleep 1; done
+       btctl connect $MAC >/dev/null; sleep 2
+       btctl connect $MAC $A2DP_SRC >/dev/null
+       play_when_ready ;;
   esac
 }
 
